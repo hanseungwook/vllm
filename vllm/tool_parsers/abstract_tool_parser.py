@@ -49,6 +49,7 @@ class ToolParser:
         self,
         tokenizer: TokenizerLike,
         tools: list[Tool] | None = None,
+        **kwargs,
     ):
         self.prev_tool_call_arr: list[dict] = []
         # the index of the tool call that is currently being parsed
