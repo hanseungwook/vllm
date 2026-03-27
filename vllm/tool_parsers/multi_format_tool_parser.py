@@ -31,53 +31,30 @@ logger = init_logger(__name__)
 class MultiFormatToolParser(ToolParser):
     """Tool parser that dispatches on ``chat_template_kwargs['tool_format']``."""
 
-    _MINIMAX_START_TOKEN = "<minimax:tool_call>"
-    _MINIMAX_END_TOKEN = "</minimax:tool_call>"
+    # minimax format: <tool_calls><invoke name="fn"><parameter name="k">v</parameter></invoke></tool_calls>
+    _MINIMAX_START_TOKEN = "<tool_calls>"
     _MINIMAX_BLOCK_REGEX = re.compile(
-        r"<minimax:tool_call>(.*?)</minimax:tool_call>",
+        r"<tool_calls>(.*?)</tool_calls>",
         re.DOTALL,
     )
     _MINIMAX_INVOKE_REGEX = re.compile(
-        r"<invoke\s+name=(.*?)>(.*?)</invoke>",
+        r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>',
         re.DOTALL,
     )
     _MINIMAX_PARAMETER_REGEX = re.compile(
-        r"<parameter\s+name=(.*?)(?:\s+string=\"(true|false)\")?\s*>(.*?)</parameter>",
+        r'<parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</parameter>',
         re.DOTALL,
     )
 
-    _DSV32_START_TOKEN = "<｜DSML｜function_calls>"
-    _DSV32_END_TOKEN = "</｜DSML｜function_calls>"
-    _DSV32_BLOCK_REGEX = re.compile(
-        r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>",
-        re.DOTALL,
-    )
-    _DSV32_INVOKE_REGEX = re.compile(
-        r"<｜DSML｜invoke\s+name=\"([^\"]+)\"\s*>(.*?)</｜DSML｜invoke>",
-        re.DOTALL,
-    )
-    _DSV32_PARAMETER_REGEX = re.compile(
-        r"<｜DSML｜parameter\s+name=\"([^\"]+)\""
-        r"(?:\s+string=\"(true|false)\")?\s*>"
-        r"(.*?)</｜DSML｜parameter>",
+    # gptoss format: <tool_call>to=functions.fn json\n{...}\n</tool_call>
+    _GPTOSS_BLOCK_REGEX = re.compile(
+        r"<tool_call>\s*to=functions\.(\S+?)(?:\s+json)?\s*\n(.*?)\n?\s*</tool_call>",
         re.DOTALL,
     )
 
-    _FUNCTION_CALLS_START_TOKEN = "<function_calls>"
-    _FUNCTION_CALLS_END_TOKEN = "</function_calls>"
-    _FUNCTION_CALLS_BLOCK_REGEX = re.compile(
-        r"<function_calls>(.*?)</function_calls>",
-        re.DOTALL,
-    )
-
-    _GPTOSS_LINE_BLOCK_REGEX = re.compile(
-        r"<\|channel\|>commentary\s+to=functions\.([^\s<]+)(?:\s+json)?\s*\n(.*?)<\|end\|>",
-        re.DOTALL,
-    )
-    _GPTOSS_HARMONY_BLOCK_REGEX = re.compile(
-        r"<\|start\|>assistant\s+to=functions\.([^\s<]+)"
-        r"\s*<\|channel\|>commentary(?:<\|constrain\|>json)?<\|message\|>"
-        r"(.*?)(?:<\|call\|>|<\|end\|>)",
+    # python format: <tool_call>\nfn(arg="val")\n</tool_call>
+    _PYTHON_BLOCK_REGEX = re.compile(
+        r"<tool_call>(.*?)</tool_call>",
         re.DOTALL,
     )
 
@@ -166,13 +143,6 @@ class MultiFormatToolParser(ToolParser):
         return None
 
     @staticmethod
-    def _strip_quotes(value: str) -> str:
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            return value[1:-1]
-        return value
-
-    @staticmethod
     def _json_or_string(value: str) -> Any:
         value = value.strip()
         try:
@@ -210,10 +180,9 @@ class MultiFormatToolParser(ToolParser):
 
         tool_calls: list[ToolCall] = []
         for block in self._MINIMAX_BLOCK_REGEX.findall(model_output):
-            for invoke_attrs, invoke_body in self._MINIMAX_INVOKE_REGEX.findall(block):
-                function_name = self._strip_quotes(invoke_attrs)
+            for function_name, invoke_body in self._MINIMAX_INVOKE_REGEX.findall(block):
                 arguments = {
-                    self._strip_quotes(param_name): self._json_or_string(param_value)
+                    param_name: self._json_or_string(param_value)
                     for param_name, _, param_value in self._MINIMAX_PARAMETER_REGEX.findall(
                         invoke_body
                     )
@@ -240,7 +209,8 @@ class MultiFormatToolParser(ToolParser):
         self,
         model_output: str,
     ) -> ExtractedToolCallInformation:
-        if self._DSV32_START_TOKEN not in model_output:
+        # dsv32 uses same outer tags as minimax but with string= attribute
+        if self._MINIMAX_START_TOKEN not in model_output:
             return ExtractedToolCallInformation(
                 tools_called=False,
                 tool_calls=[],
@@ -248,11 +218,11 @@ class MultiFormatToolParser(ToolParser):
             )
 
         tool_calls: list[ToolCall] = []
-        for block in self._DSV32_BLOCK_REGEX.findall(model_output):
-            for function_name, invoke_body in self._DSV32_INVOKE_REGEX.findall(block):
+        for block in self._MINIMAX_BLOCK_REGEX.findall(model_output):
+            for function_name, invoke_body in self._MINIMAX_INVOKE_REGEX.findall(block):
                 arguments: dict[str, Any] = {}
                 for param_name, string_flag, param_value in (
-                    self._DSV32_PARAMETER_REGEX.findall(invoke_body)
+                    self._MINIMAX_PARAMETER_REGEX.findall(invoke_body)
                 ):
                     arguments[param_name] = (
                         param_value
@@ -273,7 +243,7 @@ class MultiFormatToolParser(ToolParser):
             tool_calls=tool_calls,
             content=self._prefix_content(
                 model_output,
-                model_output.find(self._DSV32_START_TOKEN),
+                model_output.find(self._MINIMAX_START_TOKEN),
             ),
         )
 
@@ -281,9 +251,8 @@ class MultiFormatToolParser(ToolParser):
         self,
         model_output: str,
     ) -> ExtractedToolCallInformation:
-        matches = list(self._GPTOSS_HARMONY_BLOCK_REGEX.finditer(model_output))
-        if not matches:
-            matches = list(self._GPTOSS_LINE_BLOCK_REGEX.finditer(model_output))
+        # Format: <tool_call>to=functions.fn json\n{...}\n</tool_call>
+        matches = list(self._GPTOSS_BLOCK_REGEX.finditer(model_output))
 
         if not matches:
             return ExtractedToolCallInformation(
@@ -308,7 +277,9 @@ class MultiFormatToolParser(ToolParser):
         self,
         model_output: str,
     ) -> ExtractedToolCallInformation:
-        if self._FUNCTION_CALLS_START_TOKEN not in model_output:
+        # Format: <tool_call>\nfn(arg="val")\n</tool_call>
+        matches = self._PYTHON_BLOCK_REGEX.findall(model_output)
+        if not matches:
             return ExtractedToolCallInformation(
                 tools_called=False,
                 tool_calls=[],
@@ -316,14 +287,14 @@ class MultiFormatToolParser(ToolParser):
             )
 
         tool_calls: list[ToolCall] = []
-        for block in self._FUNCTION_CALLS_BLOCK_REGEX.findall(model_output):
+        for block in matches:
             module = ast.parse(block.strip())
             for statement in module.body:
                 if not isinstance(statement, ast.Expr) or not isinstance(
                     statement.value,
                     ast.Call,
                 ):
-                    raise ValueError("Expected newline-separated Python function calls.")
+                    raise ValueError("Expected Python function call(s) inside <tool_call> tags.")
                 tool_calls.append(handle_single_tool(statement.value))
 
         if not tool_calls:
@@ -338,6 +309,6 @@ class MultiFormatToolParser(ToolParser):
             tool_calls=tool_calls,
             content=self._prefix_content(
                 model_output,
-                model_output.find(self._FUNCTION_CALLS_START_TOKEN),
+                model_output.find("<tool_call>"),
             ),
         )

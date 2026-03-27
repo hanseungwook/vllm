@@ -99,12 +99,12 @@ def test_minimax_format_extracts_inline_invokes():
     extracted = run_tool_extraction_nonstreaming(
         parser,
         "Checking."
-        '<minimax:tool_call><invoke name="get_weather">'
+        '<tool_calls><invoke name="get_weather">'
         '<parameter name="city">Tokyo</parameter>'
         '<parameter name="days">5</parameter>'
         '<parameter name="enabled">true</parameter>'
         '<parameter name="filters">{"units":"metric"}</parameter>'
-        "</invoke></minimax:tool_call>",
+        "</invoke></tool_calls>",
         make_request(),
     )
 
@@ -124,13 +124,13 @@ def test_dsv32_format_honors_string_attribute():
     extracted = run_tool_extraction_nonstreaming(
         parser,
         "Prefix"
-        "<｜DSML｜function_calls>"
-        '<｜DSML｜invoke name="get_weather">'
-        '<｜DSML｜parameter name="city" string="true">Tokyo</｜DSML｜parameter>'
-        '<｜DSML｜parameter name="days" string="false">5</｜DSML｜parameter>'
-        '<｜DSML｜parameter name="enabled" string="false">false</｜DSML｜parameter>'
-        "</｜DSML｜invoke>"
-        "</｜DSML｜function_calls>",
+        "<tool_calls>"
+        '<invoke name="get_weather">'
+        '<parameter name="city" string="true">Tokyo</parameter>'
+        '<parameter name="days" string="false">5</parameter>'
+        '<parameter name="enabled" string="false">false</parameter>'
+        "</invoke>"
+        "</tool_calls>",
         make_request(),
     )
 
@@ -149,12 +149,12 @@ def test_gptoss_format_extracts_multiple_calls():
     extracted = run_tool_extraction_nonstreaming(
         parser,
         "Planning...\n"
-        "<|channel|>commentary to=functions.get_weather json\n"
+        "<tool_call>to=functions.get_weather json\n"
         '{"location":"SF"}\n'
-        "<|end|>"
-        "<|channel|>commentary to=functions.get_time json\n"
+        "</tool_call>"
+        "<tool_call>to=functions.get_time json\n"
         '{"timezone":"UTC"}\n'
-        "<|end|>",
+        "</tool_call>",
         make_request(),
     )
 
@@ -170,20 +170,33 @@ def test_gptoss_format_extracts_multiple_calls():
     }
 
 
-def test_python_format_extracts_newline_separated_calls():
+def test_python_format_extracts_single_call():
     parser = make_parser("python")
 
     extracted = run_tool_extraction_nonstreaming(
         parser,
-        "<function_calls>\n"
-        'get_weather(city="SF")\n'
-        'get_time(timezone="UTC")\n'
-        "</function_calls>",
+        '<tool_call>\nget_weather(city="SF")\n</tool_call>',
         make_request(),
     )
 
     assert extracted.tools_called
     assert extracted.content is None
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"city": "SF"}
+
+
+def test_python_format_extracts_multiple_calls():
+    parser = make_parser("python")
+
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>\nget_weather(city="SF")\n</tool_call>'
+        "\n"
+        '<tool_call>\nget_time(timezone="UTC")\n</tool_call>',
+        make_request(),
+    )
+
+    assert extracted.tools_called
     assert [tool_call.function.name for tool_call in extracted.tool_calls] == [
         "get_weather",
         "get_time",
@@ -199,8 +212,8 @@ def test_custom_formats_do_not_stream_yet():
 
     delta = parser.extract_tool_calls_streaming(
         previous_text="",
-        current_text="<function_calls>",
-        delta_text="<function_calls>",
+        current_text="<tool_call>",
+        delta_text="<tool_call>",
         previous_token_ids=[],
         current_token_ids=[],
         delta_token_ids=[],
