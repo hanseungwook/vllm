@@ -216,13 +216,12 @@ class OpenAIServingChat(OpenAIServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+            request.chat_template_kwargs,
+            self.default_chat_template_kwargs,
+        )
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
-            # Pass the same chat template kwargs as used in tokenization
-            chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                request.chat_template_kwargs,
-                self.default_chat_template_kwargs,
-            )
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
@@ -338,6 +337,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                chat_template_kwargs,
             )
 
         return await self.chat_completion_full_generator(
@@ -349,6 +349,7 @@ class OpenAIServingChat(OpenAIServing):
             tokenizer,
             request_metadata,
             reasoning_parser,
+            chat_template_kwargs,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -505,6 +506,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -565,7 +567,12 @@ class OpenAIServingChat(OpenAIServing):
                     )
 
                 tool_parsers: list[ToolParser | None] = [
-                    self.tool_parser(tokenizer, request.tools)
+                    self._create_tool_parser(
+                        self.tool_parser,
+                        tokenizer,
+                        request.tools,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
                 ] * num_choices
             else:
                 tool_parsers = [None] * num_choices
@@ -1274,6 +1281,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         from vllm.tokenizers.mistral import MistralTokenizer
 
@@ -1331,7 +1339,12 @@ class OpenAIServingChat(OpenAIServing):
                             "Tokenizer not available when `skip_tokenizer_init=True`"
                         )
 
-                    tool_parser = self.tool_parser(tokenizer, request.tools)
+                    tool_parser = self._create_tool_parser(
+                        self.tool_parser,
+                        tokenizer,
+                        request.tools,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",
@@ -1392,6 +1405,7 @@ class OpenAIServingChat(OpenAIServing):
                 content=content,
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
+                chat_template_kwargs=chat_template_kwargs,
             )
             tool_call_class = (
                 MistralToolCall if is_mistral_tokenizer(tokenizer) else ToolCall

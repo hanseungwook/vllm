@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import inspect
 import json
 import time
 from collections.abc import AsyncGenerator, Mapping
@@ -806,6 +807,47 @@ class OpenAIServing:
         # Apply server defaults first, then request kwargs override.
         return default_chat_template_kwargs | request_chat_template_kwargs
 
+    @staticmethod
+    def _get_tool_parser_init_kwargs(
+        tool_parser_cls: type[ToolParser],
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not chat_template_kwargs:
+            return {}
+
+        try:
+            init_signature = inspect.signature(tool_parser_cls.__init__)
+        except (TypeError, ValueError):
+            return {}
+
+        if "chat_template_kwargs" in init_signature.parameters:
+            return {"chat_template_kwargs": chat_template_kwargs}
+
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in init_signature.parameters.values()
+        ):
+            return {"chat_template_kwargs": chat_template_kwargs}
+
+        return {}
+
+    @classmethod
+    def _create_tool_parser(
+        cls,
+        tool_parser_cls: type[ToolParser],
+        tokenizer: TokenizerLike,
+        tools: list[Any] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> ToolParser:
+        return tool_parser_cls(
+            tokenizer,
+            tools,
+            **cls._get_tool_parser_init_kwargs(
+                tool_parser_cls,
+                chat_template_kwargs,
+            ),
+        )
+
     def _extract_prompt_components(self, prompt: PromptType | EngineInput):
         return extract_prompt_components(self.model_config, prompt)
 
@@ -884,6 +926,7 @@ class OpenAIServing:
         enable_auto_tools: bool,
         tool_parser_cls: type[ToolParser] | None,
         content: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
@@ -929,7 +972,12 @@ class OpenAIServing:
 
             # Automatic Tool Call Parsing
             try:
-                tool_parser = tool_parser_cls(tokenizer, request.tools)
+                tool_parser = OpenAIServing._create_tool_parser(
+                    tool_parser_cls,
+                    tokenizer,
+                    request.tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
             except RuntimeError as e:
                 logger.exception("Error in tool parser creation.")
                 raise e
