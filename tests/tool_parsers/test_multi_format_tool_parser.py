@@ -146,6 +146,7 @@ def test_dsv32_format_honors_string_attribute():
 def test_gptoss_format_extracts_multiple_calls():
     parser = make_parser("gptoss")
 
+    # Template-style: no "assistant" prefix
     extracted = run_tool_extraction_nonstreaming(
         parser,
         "Planning...\n"
@@ -167,6 +168,26 @@ def test_gptoss_format_extracts_multiple_calls():
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"location": "SF"}
     assert json.loads(extracted.tool_calls[1].function.arguments) == {
         "timezone": "UTC"
+    }
+
+
+def test_gptoss_format_with_assistant_prefix():
+    parser = make_parser("gptoss")
+
+    # README-style: with "assistant" prefix
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>assistant to=functions.get_weather json\n'
+        '{"location": "San Francisco, CA", "unit": "celsius"}\n'
+        "</tool_call>",
+        make_request(),
+    )
+
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA",
+        "unit": "celsius",
     }
 
 
@@ -221,3 +242,133 @@ def test_custom_formats_do_not_stream_yet():
     )
 
     assert delta is None
+
+
+# --- README spec compliance tests (exact examples from the README) ---
+
+
+def test_readme_default_example():
+    parser = make_parser("default")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>\n'
+        '{"name": "get_weather", "arguments": {"location": "San Francisco, CA"}}\n'
+        '</tool_call>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA"
+    }
+
+
+def test_readme_qwen3_example():
+    parser = make_parser("qwen3")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>\n'
+        '<function=get_weather>\n'
+        '<parameter=location>\n'
+        'San Francisco, CA\n'
+        '</parameter>\n'
+        '</function>\n'
+        '</tool_call>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA"
+    }
+
+
+def test_readme_minimax_example():
+    parser = make_parser("minimax")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_calls>\n'
+        '<invoke name="get_weather">\n'
+        '<parameter name="location">San Francisco, CA</parameter>\n'
+        '<parameter name="unit">celsius</parameter>\n'
+        '</invoke>\n'
+        '</tool_calls>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA",
+        "unit": "celsius",
+    }
+
+
+def test_readme_glm_example():
+    parser = make_parser("glm")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>get_weather'
+        '<arg_key>location</arg_key><arg_value>San Francisco, CA</arg_value>'
+        '</tool_call>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA"
+    }
+
+
+def test_readme_dsv32_example():
+    parser = make_parser("dsv32")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_calls>\n'
+        '<invoke name="get_weather">\n'
+        '<parameter name="location" string="true">San Francisco, CA</parameter>\n'
+        '<parameter name="unit" string="true">celsius</parameter>\n'
+        '</invoke>\n'
+        '</tool_calls>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    args = json.loads(extracted.tool_calls[0].function.arguments)
+    assert args == {"location": "San Francisco, CA", "unit": "celsius"}
+    # string="true" means values stay as strings
+    assert isinstance(args["location"], str)
+    assert isinstance(args["unit"], str)
+
+
+def test_readme_gptoss_example():
+    parser = make_parser("gptoss")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>assistant to=functions.get_weather json\n'
+        '{"location": "San Francisco, CA", "unit": "celsius"}\n'
+        '</tool_call>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA",
+        "unit": "celsius",
+    }
+
+
+def test_readme_python_example():
+    parser = make_parser("python")
+    extracted = run_tool_extraction_nonstreaming(
+        parser,
+        '<tool_call>\n'
+        'get_weather(location="San Francisco, CA", unit="celsius")\n'
+        '</tool_call>',
+        make_request(),
+    )
+    assert extracted.tools_called
+    assert extracted.tool_calls[0].function.name == "get_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "location": "San Francisco, CA",
+        "unit": "celsius",
+    }

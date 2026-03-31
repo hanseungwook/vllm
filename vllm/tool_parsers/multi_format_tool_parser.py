@@ -46,9 +46,10 @@ class MultiFormatToolParser(ToolParser):
         re.DOTALL,
     )
 
-    # gptoss format: <tool_call>to=functions.fn json\n{...}\n</tool_call>
+    # gptoss format: <tool_call>[assistant ]to=functions.fn json\n{...}\n</tool_call>
+    # Template renders without "assistant" prefix, but README shows it — accept both.
     _GPTOSS_BLOCK_REGEX = re.compile(
-        r"<tool_call>\s*to=functions\.(\S+?)(?:\s+json)?\s*\n(.*?)\n?\s*</tool_call>",
+        r"<tool_call>\s*(?:assistant\s+)?to=functions\.(\S+?)(?:\s+json)?\s*\n(.*?)\n?\s*</tool_call>",
         re.DOTALL,
     )
 
