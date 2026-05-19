@@ -16,16 +16,64 @@ buffer each ``<tool_call>...</tool_call>`` body, then emit the full
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
 
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, DeltaMessage
+from vllm.entrypoints.chat_utils import make_tool_call_id
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+)
 from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.base import (
     BaseToolCallStreamer,
 )
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class PythonToolCallStreamer(BaseToolCallStreamer):
-    """Streamer for the Python (literal-call) format."""
+    """Streamer for the Python (literal-call) format.
+
+    A Python tool body cannot be parsed incrementally (``ast`` needs the
+    full ``<tool_call>...</tool_call>`` body), so this streamer buffers
+    each block atomically and, once the closing marker arrives, emits two
+    OpenAI-compatible tool-call deltas in the same ``DeltaMessage``:
+
+    1. ``id`` + ``type="function"`` + ``function.name`` + ``index``.
+    2. ``function.arguments`` with the full JSON object produced by
+       :meth:`MultiFormatToolParser._handle_python_tool`.
+    """
+
+    _START_MARKER = "<tool_call>"
+    _END_MARKER = "</tool_call>"
+
+    def __init__(self, tool_format, parser_cls):
+        super().__init__(tool_format, parser_cls)
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        self._buffer: str = ""
+        self._in_block: bool = False
+        self._saw_first_call: bool = False
+        self._next_index: int = 0
+
+    @staticmethod
+    def _partial_marker_suffix_len(buffer: str, marker: str) -> int:
+        """Length of the longest non-empty suffix of ``buffer`` that is a
+        prefix of ``marker``.
+
+        Used to hold back text that might be a partially-streamed opening
+        marker, so we never emit ``"<tool_"`` as content only to later
+        learn it was the start of ``<tool_call>``.
+        """
+        max_check = min(len(buffer), len(marker) - 1)
+        for i in range(max_check, 0, -1):
+            if marker.startswith(buffer[-i:]):
+                return i
+        return 0
 
     def feed(
         self,
@@ -37,5 +85,87 @@ class PythonToolCallStreamer(BaseToolCallStreamer):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        # TODO(VLL-32 child E): implement streaming state machine.
+        if previous_text == "":
+            self._reset_state()
+
+        self._buffer += delta_text
+
+        content_parts: list[str] = []
+        tool_call_deltas: list[DeltaToolCall] = []
+
+        while True:
+            if not self._in_block:
+                start_idx = self._buffer.find(self._START_MARKER)
+                if start_idx >= 0:
+                    prefix = self._buffer[:start_idx]
+                    if not self._saw_first_call and prefix:
+                        content_parts.append(prefix)
+                    self._buffer = self._buffer[start_idx + len(self._START_MARKER) :]
+                    self._in_block = True
+                    continue
+
+                hold_len = self._partial_marker_suffix_len(
+                    self._buffer, self._START_MARKER
+                )
+                safe_end = len(self._buffer) - hold_len
+                if safe_end > 0:
+                    emit_text = self._buffer[:safe_end]
+                    if not self._saw_first_call:
+                        content_parts.append(emit_text)
+                    self._buffer = self._buffer[safe_end:]
+                break
+
+            end_idx = self._buffer.find(self._END_MARKER)
+            if end_idx < 0:
+                break
+
+            body = self._buffer[:end_idx]
+            self._buffer = self._buffer[end_idx + len(self._END_MARKER) :]
+            self._in_block = False
+            self._saw_first_call = True
+
+            try:
+                module = ast.parse(body.strip())
+                if not module.body:
+                    raise ValueError("Empty Python tool call body.")
+                statement = module.body[0]
+                if not isinstance(statement, ast.Expr) or not isinstance(
+                    statement.value, ast.Call
+                ):
+                    raise ValueError(
+                        "Expected Python function call inside <tool_call> tags."
+                    )
+                tool_call = self._parser._handle_python_tool(statement.value)
+            except Exception:
+                logger.exception("Failed to parse Python tool call body: %r", body)
+                continue
+
+            index = self._next_index
+            self._next_index += 1
+
+            tool_call_deltas.append(
+                DeltaToolCall(
+                    id=make_tool_call_id(),
+                    type="function",
+                    index=index,
+                    function=DeltaFunctionCall(name=tool_call.function.name),
+                )
+            )
+            tool_call_deltas.append(
+                DeltaToolCall(
+                    index=index,
+                    function=DeltaFunctionCall(arguments=tool_call.function.arguments),
+                )
+            )
+
+        if tool_call_deltas:
+            content_text = "".join(content_parts) if content_parts else None
+            return DeltaMessage(
+                content=content_text,
+                tool_calls=tool_call_deltas,
+            )
+
+        if content_parts:
+            return DeltaMessage(content="".join(content_parts))
+
         return None
