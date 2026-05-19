@@ -406,22 +406,6 @@ def test_python_format_accepts_nested_json_style_literals():
     }
 
 
-def test_custom_formats_do_not_stream_yet():
-    parser = make_parser("python")
-
-    delta = parser.extract_tool_calls_streaming(
-        previous_text="",
-        current_text="<tool_call>",
-        delta_text="<tool_call>",
-        previous_token_ids=[],
-        current_token_ids=[],
-        delta_token_ids=[],
-        request=make_request(),
-    )
-
-    assert delta is None
-
-
 def test_readme_json_example():
     parser = make_parser("json")
     extracted = run_tool_extraction_nonstreaming(

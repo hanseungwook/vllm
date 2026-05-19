@@ -17,6 +17,10 @@ from vllm.entrypoints.openai.protocol import (
     ToolCall,
 )
 from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import ToolParser
+from vllm.entrypoints.openai.tool_parsers.multi_format_streamers import (
+    BaseToolCallStreamer,
+    build_streamer,
+)
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
@@ -103,6 +107,7 @@ class MultiFormatToolParser(ToolParser):
                 break
         self.tool_format = self._validate_tool_format(raw_tool_format)
         self._delegate: ToolParser | None = None
+        self._streamer: BaseToolCallStreamer | None = None
 
         if self.tool_format == "qwen3":
             from vllm.entrypoints.openai.tool_parsers.qwen3xml_tool_parser import (
@@ -110,6 +115,8 @@ class MultiFormatToolParser(ToolParser):
             )
 
             self._delegate = Qwen3XMLToolParser(tokenizer)
+        else:
+            self._streamer = build_streamer(self.tool_format, type(self))
 
     @classmethod
     def _validate_tool_format(cls, tool_format: Any) -> str:
@@ -181,6 +188,17 @@ class MultiFormatToolParser(ToolParser):
     ) -> DeltaMessage | None:
         if self._delegate is not None:
             return self._delegate.extract_tool_calls_streaming(
+                previous_text,
+                current_text,
+                delta_text,
+                previous_token_ids,
+                current_token_ids,
+                delta_token_ids,
+                request,
+            )
+
+        if self._streamer is not None:
+            return self._streamer.feed(
                 previous_text,
                 current_text,
                 delta_text,
