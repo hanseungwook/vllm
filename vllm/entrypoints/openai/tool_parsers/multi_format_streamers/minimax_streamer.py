@@ -79,6 +79,12 @@ class MinimaxToolCallStreamer(BaseToolCallStreamer):
         # Tool indices for which the START delta (id + name) has already
         # been emitted in a prior feed() call.
         self._tool_name_sent: set[int] = set()
+        # Accumulator for the current invoke's parsed arguments.
+        self._current_args: dict[str, Any] = {}
+        # Clear (not reassign) so the alias set in
+        # MultiFormatToolParser.__init__ stays valid across resets.
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     def feed(
         self,
@@ -163,6 +169,7 @@ class MinimaxToolCallStreamer(BaseToolCallStreamer):
             self._buffer = self._buffer[invoke_match.end() :]
             self._tool_index += 1
             self._first_param_in_invoke = True
+            self._current_args = {}
             self._apply_tool_event(
                 tool_updates,
                 tool_index=self._tool_index,
@@ -170,6 +177,8 @@ class MinimaxToolCallStreamer(BaseToolCallStreamer):
                 name=name,
                 args_chunk="{",
             )
+            self.record_tool_call_start(self._tool_index, name)
+            self.record_args_fragment(self._tool_index, "{")
             self._state = _STATE_IN_INVOKE
             return True
         return False
@@ -185,6 +194,8 @@ class MinimaxToolCallStreamer(BaseToolCallStreamer):
                 tool_index=self._tool_index,
                 args_chunk="}",
             )
+            self.record_args_fragment(self._tool_index, "}")
+            self.record_args_final(self._tool_index, dict(self._current_args))
             self._state = _STATE_IN_TOOL_CALLS
             return True
 
@@ -217,6 +228,9 @@ class MinimaxToolCallStreamer(BaseToolCallStreamer):
             tool_index=self._tool_index,
             args_chunk=args_chunk,
         )
+        if self._param_name is not None:
+            self._current_args[self._param_name] = parsed_value
+        self.record_args_fragment(self._tool_index, args_chunk)
         self._state = _STATE_IN_INVOKE
         return True
 

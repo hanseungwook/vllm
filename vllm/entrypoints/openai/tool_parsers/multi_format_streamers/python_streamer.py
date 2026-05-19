@@ -17,6 +17,7 @@ buffer each ``<tool_call>...</tool_call>`` body, then emit the full
 from __future__ import annotations
 
 import ast
+import json
 from collections.abc import Sequence
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
@@ -59,6 +60,10 @@ class PythonToolCallStreamer(BaseToolCallStreamer):
         self._in_block: bool = False
         self._saw_first_call: bool = False
         self._next_index: int = 0
+        # Clear (not reassign) the inherited lists so the alias set in
+        # MultiFormatToolParser.__init__ stays valid across resets.
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     @staticmethod
     def _partial_marker_suffix_len(buffer: str, marker: str) -> int:
@@ -157,6 +162,10 @@ class PythonToolCallStreamer(BaseToolCallStreamer):
                     function=DeltaFunctionCall(arguments=tool_call.function.arguments),
                 )
             )
+
+            self.record_tool_call_start(index, tool_call.function.name)
+            self.record_args_fragment(index, tool_call.function.arguments)
+            self.record_args_final(index, json.loads(tool_call.function.arguments))
 
         if tool_call_deltas:
             content_text = "".join(content_parts) if content_parts else None

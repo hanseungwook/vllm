@@ -41,6 +41,53 @@ class BaseToolCallStreamer(ABC):
     ) -> None:
         self.tool_format = tool_format
         self._parser = parser_cls
+        # End-of-stream flush state read by ``serving_chat.py``. ``serving_chat``
+        # uses ``len(prev_tool_call_arr) > 0`` to decide ``finish_reason="tool_calls"``
+        # and reads both lists to flush any unstreamed argument tail. Subclasses
+        # MUST mutate these lists in place (``.append``, ``.clear``) — never
+        # reassign — so the owning ``MultiFormatToolParser`` can alias them.
+        self.prev_tool_call_arr: list[dict] = []
+        self.streamed_args_for_tool: list[str] = []
+
+    def record_tool_call_start(self, index: int, name: str) -> None:
+        """Append a placeholder entry for a newly-started tool call.
+
+        Subclasses MUST call this when emitting the first delta for each
+        tool call (the delta that carries ``id`` + ``function.name``).
+        Pads both lists so ``index`` is a valid slot.
+        """
+        while len(self.prev_tool_call_arr) <= index:
+            self.prev_tool_call_arr.append({"name": "", "arguments": {}})
+            self.streamed_args_for_tool.append("")
+        self.prev_tool_call_arr[index]["name"] = name
+
+    def record_args_fragment(self, index: int, args_fragment: str) -> None:
+        """Record an emitted ``function.arguments`` fragment for a tool call.
+
+        ``args_fragment`` is the raw JSON-string fragment that went into the
+        emitted ``DeltaMessage``. ``serving_chat.py`` compares
+        ``json.dumps(prev_tool_call_arr[i]['arguments'])`` with
+        ``streamed_args_for_tool[i]`` to compute any remaining flush; for
+        streamers that emit complete coerced JSON for every arg, these match
+        once the tool call is closed and the flush is a no-op.
+        """
+        while len(self.streamed_args_for_tool) <= index:
+            self.prev_tool_call_arr.append({"name": "", "arguments": {}})
+            self.streamed_args_for_tool.append("")
+        self.streamed_args_for_tool[index] += args_fragment
+
+    def record_args_final(self, index: int, arguments: dict) -> None:
+        """Record the fully-parsed arguments dict for a completed tool call.
+
+        Used at end-of-tool emission so ``serving_chat.py``'s unstreamed-arg
+        flush can compute ``json.dumps(arguments) - streamed_args_for_tool``
+        and emit any tail bytes (a no-op when our streaming output already
+        matches the canonical JSON serialization).
+        """
+        while len(self.prev_tool_call_arr) <= index:
+            self.prev_tool_call_arr.append({"name": "", "arguments": {}})
+            self.streamed_args_for_tool.append("")
+        self.prev_tool_call_arr[index]["arguments"] = arguments
 
     @abstractmethod
     def feed(

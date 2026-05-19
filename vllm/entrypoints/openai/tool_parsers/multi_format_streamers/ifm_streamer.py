@@ -18,15 +18,11 @@ Handles three closely-related formats:
 See ``MultiFormatToolParser._extract_ifm_xml_tool_calls`` and
 ``_extract_ifm_json_tool_calls`` for the non-streaming reference behavior.
 
-Note: ``prev_tool_call_arr`` and ``streamed_args_for_tool`` are mirrored
-internally on the streamer; the owning parser instance's identically-named
-fields (inherited from ``ToolParser``) stay empty during streaming, since
-``BaseToolCallStreamer`` is constructed with the parser class, not the
-parser instance. The ``serving_chat.py`` end-of-stream unstreamed-token
-flush is therefore a no-op for this streamer -- which is fine, because we
-emit complete coerced JSON for every argument as soon as
-``</ifm|arg_value>`` is observed; there are no partially-streamed argument
-tails to flush.
+``prev_tool_call_arr`` and ``streamed_args_for_tool`` are inherited from
+``BaseToolCallStreamer`` and aliased to the owning parser instance, so
+``serving_chat.py``'s end-of-stream flush logic sees the live streaming
+state. Because every argument is emitted as complete coerced JSON as soon
+as ``</ifm|arg_value>`` is observed, the flush is always a no-op.
 """
 
 from __future__ import annotations
@@ -129,19 +125,10 @@ class IFMToolCallStreamer(BaseToolCallStreamer):
         self._arg_key_buffer: str = ""
         self._arg_type_buffer: str = ""
         self._streamed_args_running: str = ""
-        # Mirror of parser-instance fields read by serving_chat.py at
-        # end-of-stream. Kept on the streamer because we only hold the
-        # parser class, not the instance.
-        self._prev_tool_call_arr: list[dict[str, Any]] = []
-        self._streamed_args_for_tool: list[str] = []
-
-    @property
-    def prev_tool_call_arr(self) -> list[dict[str, Any]]:
-        return self._prev_tool_call_arr
-
-    @property
-    def streamed_args_for_tool(self) -> list[str]:
-        return self._streamed_args_for_tool
+        # Clear (not reassign) the inherited lists so the alias set in
+        # MultiFormatToolParser.__init__ stays valid across resets.
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     def feed(
         self,
@@ -542,13 +529,13 @@ class IFMToolCallStreamer(BaseToolCallStreamer):
         self._streamed_args_running = ""
 
     def _record_completed_tool(self) -> None:
-        self._prev_tool_call_arr.append(
+        self.prev_tool_call_arr.append(
             {
                 "name": self._current_tool_name,
                 "arguments": dict(self._args_so_far),
             }
         )
-        self._streamed_args_for_tool.append(self._streamed_args_running)
+        self.streamed_args_for_tool.append(self._streamed_args_running)
 
     def _goto_inter_tool_phase(self) -> None:
         # Whether or not the outer wrapper was seen, look for the next tool

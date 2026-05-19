@@ -117,6 +117,13 @@ class MultiFormatToolParser(ToolParser):
             self._delegate = Qwen3XMLToolParser(tokenizer)
         else:
             self._streamer = build_streamer(self.tool_format, type(self))
+            if self._streamer is not None:
+                # Alias the parser-instance fields read by serving_chat.py at
+                # end-of-stream to the streamer's lists. The streamer mutates
+                # these in place (never reassigns), so the alias stays valid
+                # across feed() calls and serving_chat sees the live state.
+                self.prev_tool_call_arr = self._streamer.prev_tool_call_arr
+                self.streamed_args_for_tool = self._streamer.streamed_args_for_tool
 
     @classmethod
     def _validate_tool_format(cls, tool_format: Any) -> str:

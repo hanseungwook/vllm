@@ -15,6 +15,7 @@ header line is consumed.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 
 import regex as re
@@ -52,6 +53,10 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
         self._tool_index: int = -1
         self._args_emitted_len: int = 0
         self._first_tool_seen: bool = False
+        # Clear (not reassign) so the alias set in
+        # MultiFormatToolParser.__init__ stays valid across resets.
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     def feed(
         self,
@@ -130,6 +135,7 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
                 function=DeltaFunctionCall(name=function_name, arguments=""),
             )
         )
+        self.record_tool_call_start(self._tool_index, function_name)
         self._buffer = self._buffer[idx + 1 :]
         self._state = _STATE_ARGS
         return True
@@ -146,6 +152,10 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
                         function=DeltaFunctionCall(arguments=new_to_emit),
                     )
                 )
+                self.record_args_fragment(self._tool_index, new_to_emit)
+            self.record_args_final(
+                self._tool_index, json.loads(args_portion) if args_portion else {}
+            )
             self._buffer = self._buffer[close_idx + len(_TOOL_CALL_CLOSE) :]
             self._state = _STATE_OUTSIDE
             self._args_emitted_len = 0
@@ -159,6 +169,7 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
                     function=DeltaFunctionCall(arguments=new_to_emit),
                 )
             )
+            self.record_args_fragment(self._tool_index, new_to_emit)
             self._args_emitted_len = safe_end
         return False
 

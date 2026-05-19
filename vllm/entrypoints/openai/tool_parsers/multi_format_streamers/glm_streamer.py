@@ -58,6 +58,11 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         self._value_buffer: str = ""
         self._current_key: str = ""
         self._brace_opened: bool = False
+        self._current_args: dict = {}
+        # Clear (not reassign) so the alias set in
+        # MultiFormatToolParser.__init__ stays valid across resets.
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     def feed(
         self,
@@ -163,6 +168,7 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         self._name_buffer = ""
         self._current_tool_name = ""
         self._brace_opened = False
+        self._current_args = {}
         return "progress"
 
     def _step_name(self, tool_event) -> str:
@@ -190,12 +196,15 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         tool_event["index"] = self._current_tool_idx
         tool_event["id"] = make_tool_call_id()
         tool_event["name"] = name
+        self.record_tool_call_start(self._current_tool_idx, name)
 
         if marker == self._ARG_KEY_OPEN:
             self._state = self._KEY
             self._key_buffer = ""
         else:
             tool_event["args_parts"].append("{}")
+            self.record_args_fragment(self._current_tool_idx, "{}")
+            self.record_args_final(self._current_tool_idx, {})
             self._brace_opened = True
             self._state = self._OUTSIDE
         return "progress"
@@ -263,6 +272,8 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
             tool_event["present"] = True
             tool_event["index"] = self._current_tool_idx
         tool_event["args_parts"].append(fragment)
+        self._current_args[self._current_key] = coerced
+        self.record_args_fragment(self._current_tool_idx, fragment)
         self._state = self._AFTER_VALUE
         return "progress"
 
@@ -287,6 +298,8 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
                 tool_event["present"] = True
                 tool_event["index"] = self._current_tool_idx
             tool_event["args_parts"].append("}")
+            self.record_args_fragment(self._current_tool_idx, "}")
+            self.record_args_final(self._current_tool_idx, dict(self._current_args))
             self._state = self._OUTSIDE
         return "progress"
 
