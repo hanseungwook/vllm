@@ -185,45 +185,46 @@ class IFMJSONToolCallStreamer(BaseToolCallStreamer):
         return True
 
     def _step_between(self) -> bool:
+        # Inside an outer wrapper: a new <ifm|tool_call> opens a block, or
+        # </ifm|tool_calls> exits the wrapper. Bare-block mode (no wrapper)
+        # only looks for <ifm|tool_call>.
         markers: tuple[str, ...] = (self._CALL_OPEN,)
         if self._has_outer_wrapper:
             markers = markers + (self._OUTER_CLOSE,)
+        return self._consume_to_marker(markers, after_wrapper=False)
+
+    def _step_after_wrapper(self) -> bool:
+        # After </ifm|tool_calls>: finditer matches every <ifm|tool_call>
+        # regardless of wrapper, so keep looking for another outer wrapper
+        # or a bare block. Drop any intervening text.
+        return self._consume_to_marker(
+            (self._OUTER_OPEN, self._CALL_OPEN), after_wrapper=True
+        )
+
+    def _consume_to_marker(
+        self, markers: tuple[str, ...], after_wrapper: bool
+    ) -> bool:
+        """Shared marker-scan + phase transition for ``_BETWEEN`` /
+        ``_AFTER_WRAPPER``. Drops intervening text (non-streaming reference
+        only treats the pre-first-tool prefix as content)."""
         pos = self._first_marker(markers)
         if pos is None:
             hold = self._partial_marker_suffix_len(self._buffer, markers)
             safe_end = len(self._buffer) - hold
             if safe_end > 0:
-                # Discard intervening content (non-streaming reference only
-                # treats the pre-first-tool prefix as content).
                 self._buffer = self._buffer[safe_end:]
             return False
         idx, marker = pos
         self._buffer = self._buffer[idx + len(marker) :]
         if marker == self._CALL_OPEN:
             self._enter_block()
-        else:
-            self._phase = self._AFTER_WRAPPER
-        return True
-
-    def _step_after_wrapper(self) -> bool:
-        # finditer matches every <ifm|tool_call> regardless of wrappers, so
-        # keep looking for either a new outer wrapper or a bare block. Drop
-        # any intervening text.
-        markers = (self._OUTER_OPEN, self._CALL_OPEN)
-        pos = self._first_marker(markers)
-        if pos is None:
-            hold = self._partial_marker_suffix_len(self._buffer, markers)
-            safe_end = len(self._buffer) - hold
-            if safe_end > 0:
-                self._buffer = self._buffer[safe_end:]
-            return False
-        idx, marker = pos
-        self._buffer = self._buffer[idx + len(marker) :]
-        if marker == self._OUTER_OPEN:
+        elif marker == self._OUTER_OPEN:
             self._has_outer_wrapper = True
             self._phase = self._BETWEEN
         else:
-            self._enter_block()
+            # _OUTER_CLOSE, only reachable from _BETWEEN (after_wrapper=False).
+            assert not after_wrapper
+            self._phase = self._AFTER_WRAPPER
         return True
 
     def _enter_block(self) -> None:

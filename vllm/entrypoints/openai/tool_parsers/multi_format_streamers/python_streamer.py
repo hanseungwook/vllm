@@ -154,6 +154,14 @@ class PythonToolCallStreamer(BaseToolCallStreamer):
                 index = self._next_index
                 self._next_index += 1
 
+                # Two entries: name-only (arguments=None) then args-only.
+                # The name entry's ``arguments=None`` is load-bearing — it
+                # makes ``serving_chat``'s ``_should_check_for_unstreamed_
+                # tool_arg_tokens`` short-circuit (it checks
+                # ``tool_calls[0].function.arguments is not None``), so the
+                # end-of-stream flush does NOT replace this DeltaMessage and
+                # the args entry survives. Setting ``arguments=""`` here
+                # would trip the flush and drop the args entry.
                 tool_call_deltas.append(
                     DeltaToolCall(
                         id=make_tool_call_id(),
