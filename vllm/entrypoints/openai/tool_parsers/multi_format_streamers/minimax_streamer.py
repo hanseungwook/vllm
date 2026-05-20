@@ -231,6 +231,11 @@ class MinimaxToolCallStreamer(BaseToolCallStreamer):
         if self._param_name is not None:
             self._current_args[self._param_name] = parsed_value
         self.record_args_fragment(self._tool_index, args_chunk)
+        # Keep prev_tool_call_arr in sync after every parameter so
+        # serving_chat's end-of-stream flush stays a no-op even on
+        # EOS-mid-invoke (json.dumps of partial dict is a strict prefix of
+        # streamed args, missing only the closing "}").
+        self.record_args_final(self._tool_index, dict(self._current_args))
         self._state = _STATE_IN_INVOKE
         return True
 

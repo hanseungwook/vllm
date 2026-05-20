@@ -188,6 +188,10 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         name = self._name_buffer.strip()
         self._buffer = self._buffer[idx + len(marker) :]
         if not name:
+            # Empty-name tool: skip without padding prev_tool_call_arr.
+            # Decrement so the next valid tool gets the right slot index
+            # (matches IFM XML's _step_collecting_name recovery).
+            self._current_tool_idx -= 1
             self._state = self._OUTSIDE
             return "progress"
 
@@ -302,6 +306,11 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         tool_event["args_parts"].append(fragment)
         self._current_args[self._current_key] = coerced
         self.record_args_fragment(self._current_tool_idx, fragment)
+        # Keep prev_tool_call_arr in sync after every arg so serving_chat's
+        # end-of-stream flush stays a no-op even on EOS-mid-call (the
+        # canonical json.dumps of the partial dict is a strict prefix of the
+        # streamed args, missing only the closing "}").
+        self.record_args_final(self._current_tool_idx, dict(self._current_args))
         self._state = self._AFTER_VALUE
         return "progress"
 

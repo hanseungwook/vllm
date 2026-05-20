@@ -170,9 +170,13 @@ class IFMXMLToolCallStreamer(BaseToolCallStreamer):
             return self._step_after_arg_value()
         if p == self._SKIP:
             return self._step_skipping_until_close()
-        # _AFTER
-        self._buffer = ""
-        return _STALL
+        # _AFTER — outer wrapper closed; the non-streaming reference
+        # ``_IFM_BLOCK_REGEX.finditer`` matches every ``<ifm|tool_call>``
+        # block in the response, so a second ``<ifm|tool_calls>`` wrapper
+        # or a bare ``<ifm|tool_call>`` after the close must still be
+        # parsed. Drop any intervening text (matches non-streaming, which
+        # treats only the pre-first-tool prefix as content).
+        return self._step_after()
 
     def _step_before(self):
         pos = self._first_marker((self._TOOL_CALLS_START, self._TOOL_CALL_START))
@@ -278,10 +282,14 @@ class IFMXMLToolCallStreamer(BaseToolCallStreamer):
         return _PROGRESS
 
     def _step_after_arg_key(self):
-        markers: list[str] = []
-        if self.tool_format == "xml_typed":
-            markers.append(self._ARG_TYPE_START)
-        markers.append(self._ARG_VALUE_START)
+        # Always recognize <ifm|arg_type>: the non-streaming
+        # _IFM_ARG_REGEX captures the optional type group regardless of
+        # tool_format and forwards it to _coerce_argument_value. Limiting
+        # this to xml_typed would silently drop the type tag if the model
+        # emits one under plain xml (e.g., a schema-string field where the
+        # model annotates the type) and produce a different coerced value
+        # than the non-streaming path.
+        markers = [self._ARG_TYPE_START, self._ARG_VALUE_START]
         pos = self._first_marker(markers)
         if pos is None:
             return _STALL
@@ -355,6 +363,32 @@ class IFMXMLToolCallStreamer(BaseToolCallStreamer):
             return _PROGRESS
         self._buffer = self._buffer[pos + len(self._TOOL_CALL_END) :]
         self._phase = self._BETWEEN
+        return _PROGRESS
+
+    def _step_after(self):
+        # After the outer ``</ifm|tool_calls>``, look for another outer
+        # wrapper or a bare ``<ifm|tool_call>`` so the non-streaming
+        # finditer semantics are preserved across multiple wrappers.
+        markers = (self._TOOL_CALLS_START, self._TOOL_CALL_START)
+        pos = self._first_marker(markers)
+        if pos is None:
+            safe, tail = self._split_at_partial_marker(self._buffer, markers)
+            if not safe:
+                return _STALL
+            # Drop intervening content (matches non-streaming, which only
+            # treats the pre-first-tool prefix as content).
+            self._buffer = tail
+            return _PROGRESS
+
+        idx, marker = pos
+        self._buffer = self._buffer[idx + len(marker) :]
+        if marker == self._TOOL_CALLS_START:
+            self._has_outer_wrapper = True
+            self._phase = self._BETWEEN
+        else:
+            self._current_tool_index += 1
+            self._reset_per_tool_state()
+            self._phase = self._NAME
         return _PROGRESS
 
     def _first_marker(self, markers: Sequence[str]) -> tuple[int, str] | None:
