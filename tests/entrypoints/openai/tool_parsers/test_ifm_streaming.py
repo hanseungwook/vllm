@@ -925,3 +925,121 @@ def test_glm_string_arg_streams_char_by_char_with_schema():
     assert len(seen) >= 5, (
         f"GLM schema=string should stream char-by-char; got {len(seen)} args fragments"
     )
+
+def test_json_format_streams_args_incrementally():
+    """Char-by-char streaming of a JSON body should produce more than one
+    argument fragment — args are emitted as they're parsed, not buffered
+    until the close marker.
+    """
+    parser = make_parser("json")
+    request = make_request()
+    body = (
+        '<ifm|tool_call>{"name":"foo","arguments":'
+        '{"city":"SF","unit":"celsius"}}</ifm|tool_call>'
+    )
+
+    arg_fragments: list[str] = []
+    name_seen: str | None = None
+    previous_text = ""
+    for ch in body:
+        current_text = previous_text + ch
+        msg = parser.extract_tool_calls_streaming(
+            previous_text, current_text, ch, [], [], [], request
+        )
+        previous_text = current_text
+        if msg is None or not msg.tool_calls:
+            continue
+        call = msg.tool_calls[0]
+        if call.function and call.function.name:
+            name_seen = call.function.name
+        if call.function and call.function.arguments:
+            arg_fragments.append(call.function.arguments)
+
+    assert name_seen == "foo"
+    assert "".join(arg_fragments) == '{"city": "SF", "unit": "celsius"}'
+    # The whole point of using ``partial_json_parser``: at least two
+    # argument deltas, not one big atomic emit at the close marker.
+    assert len(arg_fragments) > 1, (
+        f"expected incremental args emit, got one big fragment: {arg_fragments}"
+    )
+
+
+def test_json_format_eos_mid_args_records_partial_state_for_flush():
+    """Model stops mid-call (EOS without ``</ifm|tool_call>``) — the streamer
+    must still expose ``prev_tool_call_arr`` and ``streamed_args_for_tool``
+    so ``serving_chat``'s flush emits the missing tail with the right index.
+    """
+    parser = make_parser("json")
+    request = make_request()
+    # No </ifm|tool_call>: stream ends mid-args.
+    model_output = '<ifm|tool_call>{"name":"foo","arguments":{"city":"SF"}'
+
+    run_tool_extraction_streaming(parser, model_output, request=request)
+    streamer = parser._streamer
+    assert streamer is not None
+    mirror = streamer.prev_tool_call_arr
+    assert len(mirror) == 1
+    assert mirror[0]["name"] == "foo"
+    assert mirror[0]["arguments"] == {"city": "SF"}
+    streamed = streamer.streamed_args_for_tool[0]
+    canonical = json.dumps(mirror[0]["arguments"], ensure_ascii=False)
+    # Critical streaming invariant: at any partial point the streamed bytes
+    # form a prefix of the canonical args JSON, so the serving_chat flush is
+    # ``canonical[len(streamed):]`` — at worst a tail, never a duplication.
+    assert canonical.startswith(streamed)
+
+
+def test_json_format_list_body_emits_calls_with_distinct_indices():
+    """The list-body case used to dump all calls into one DeltaMessage, which
+    broke ``serving_chat``'s flush logic (it indexes by tool_calls[0] but
+    reads prev_tool_call_arr[-1]). With incremental emit each list element
+    gets its own ``index`` in distinct deltas.
+    """
+    parser = make_parser("json")
+    request = make_request()
+    body = (
+        "<ifm|tool_call>["
+        '{"name":"a","arguments":{"x":1}},'
+        '{"name":"b","arguments":{"y":2}}'
+        "]</ifm|tool_call>"
+    )
+
+    indices_seen_per_delta: list[set[int]] = []
+    previous_text = ""
+    for ch in body:
+        current_text = previous_text + ch
+        msg = parser.extract_tool_calls_streaming(
+            previous_text, current_text, ch, [], [], [], request
+        )
+        previous_text = current_text
+        if msg is None or not msg.tool_calls:
+            continue
+        indices_seen_per_delta.append({tc.index for tc in msg.tool_calls})
+
+    # Every delta touches exactly one tool index — never both at once.
+    for indices in indices_seen_per_delta:
+        assert len(indices) == 1, (
+            f"a single delta carried multiple tool indices: {indices}"
+        )
+    # Both tools' indices appeared, separately.
+    all_indices = {idx for s in indices_seen_per_delta for idx in s}
+    assert all_indices == {0, 1}
+
+    streamer = parser._streamer
+    assert streamer is not None
+    assert len(streamer.prev_tool_call_arr) == 2
+    assert streamer.prev_tool_call_arr[0]["name"] == "a"
+    assert streamer.prev_tool_call_arr[1]["name"] == "b"
+
+
+def test_json_format_function_wrapped_call_still_extracts_name():
+    """The non-streaming parser accepts ``{"function":{"name":...}}`` as well
+    as the flat form. The streamer should too.
+    """
+    model_output = (
+        '<ifm|tool_call>{"function":{"name":"foo","arguments":'
+        '{"city":"SF"}}}</ifm|tool_call>'
+    )
+    reconstructor = assert_round_trip("json", model_output, make_request())
+    assert reconstructor.tool_calls[0].function.name == "foo"
+    assert json.loads(reconstructor.tool_calls[0].function.arguments) == {"city": "SF"}
