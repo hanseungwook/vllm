@@ -133,39 +133,49 @@ class PythonToolCallStreamer(BaseToolCallStreamer):
                 module = ast.parse(body.strip())
                 if not module.body:
                     raise ValueError("Empty Python tool call body.")
-                statement = module.body[0]
-                if not isinstance(statement, ast.Expr) or not isinstance(
-                    statement.value, ast.Call
-                ):
-                    raise ValueError(
-                        "Expected Python function call inside <tool_call> tags."
-                    )
-                tool_call = self._parser._handle_python_tool(statement.value)
+                statements = []
+                for statement in module.body:
+                    if not isinstance(statement, ast.Expr) or not isinstance(
+                        statement.value, ast.Call
+                    ):
+                        raise ValueError(
+                            "Expected Python function call(s) inside "
+                            "<tool_call> tags."
+                        )
+                    statements.append(statement.value)
+                tool_calls_for_block = [
+                    self._parser._handle_python_tool(call) for call in statements
+                ]
             except Exception:
                 logger.exception("Failed to parse Python tool call body: %r", body)
                 continue
 
-            index = self._next_index
-            self._next_index += 1
+            for tool_call in tool_calls_for_block:
+                index = self._next_index
+                self._next_index += 1
 
-            tool_call_deltas.append(
-                DeltaToolCall(
-                    id=make_tool_call_id(),
-                    type="function",
-                    index=index,
-                    function=DeltaFunctionCall(name=tool_call.function.name),
+                tool_call_deltas.append(
+                    DeltaToolCall(
+                        id=make_tool_call_id(),
+                        type="function",
+                        index=index,
+                        function=DeltaFunctionCall(name=tool_call.function.name),
+                    )
                 )
-            )
-            tool_call_deltas.append(
-                DeltaToolCall(
-                    index=index,
-                    function=DeltaFunctionCall(arguments=tool_call.function.arguments),
+                tool_call_deltas.append(
+                    DeltaToolCall(
+                        index=index,
+                        function=DeltaFunctionCall(
+                            arguments=tool_call.function.arguments
+                        ),
+                    )
                 )
-            )
 
-            self.record_tool_call_start(index, tool_call.function.name)
-            self.record_args_fragment(index, tool_call.function.arguments)
-            self.record_args_final(index, json.loads(tool_call.function.arguments))
+                self.record_tool_call_start(index, tool_call.function.name)
+                self.record_args_fragment(index, tool_call.function.arguments)
+                self.record_args_final(
+                    index, json.loads(tool_call.function.arguments)
+                )
 
         if tool_call_deltas:
             content_text = "".join(content_parts) if content_parts else None

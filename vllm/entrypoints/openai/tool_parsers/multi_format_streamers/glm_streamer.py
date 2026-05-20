@@ -131,7 +131,7 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         if s == self._KEY:
             return self._step_key()
         if s == self._AFTER_KEY:
-            return self._step_after_key()
+            return self._step_after_key(tool_event)
         if s == self._VALUE:
             return self._step_value(tool_event, request)
         if s == self._AFTER_VALUE:
@@ -224,18 +224,46 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
         self._state = self._AFTER_KEY
         return "progress"
 
-    def _step_after_key(self) -> str:
-        idx = self._buffer.find(self._ARG_VALUE_OPEN)
-        if idx == -1:
-            safe_end = self._safe_emit_end(self._buffer, [self._ARG_VALUE_OPEN])
+    def _step_after_key(self, tool_event) -> str:
+        # Both ``<arg_value>`` (well-formed) and ``</tool_call>`` (malformed:
+        # key without a value) are valid next markers. Without handling the
+        # second case, a model that emits ``<arg_key>k</arg_key></tool_call>``
+        # would stall the stream forever.
+        markers = [self._ARG_VALUE_OPEN, self._TOOL_CALL_CLOSE]
+        idx, marker = self._find_first_marker(self._buffer, markers)
+        if idx == -1 or marker is None:
+            safe_end = self._safe_emit_end(self._buffer, markers)
             if safe_end <= 0:
                 return "stuck"
             self._buffer = self._buffer[safe_end:]
             return "progress"
-        self._buffer = self._buffer[idx + len(self._ARG_VALUE_OPEN) :]
-        self._value_buffer = ""
-        self._state = self._VALUE
+        self._buffer = self._buffer[idx + len(marker) :]
+        if marker == self._ARG_VALUE_OPEN:
+            self._value_buffer = ""
+            self._state = self._VALUE
+        else:
+            # Orphan key (key without value) — drop it. Non-streaming regex
+            # requires ``<arg_key>K</arg_key><arg_value>V</arg_value>`` pairs,
+            # so it also silently drops a key without a value. Close the tool
+            # with whatever args were collected before this key.
+            self._emit_tool_close(tool_event)
+            self._state = self._OUTSIDE
         return "progress"
+
+    def _emit_tool_close(self, tool_event) -> None:
+        """Append the closing args fragment for the current tool and record
+        the final args dict. Used by ``_step_after_value`` (normal path) and
+        ``_step_after_key`` (orphan-key recovery)."""
+        if not tool_event["present"]:
+            tool_event["present"] = True
+            tool_event["index"] = self._current_tool_idx
+        if self._brace_opened:
+            tool_event["args_parts"].append("}")
+            self.record_args_fragment(self._current_tool_idx, "}")
+        else:
+            tool_event["args_parts"].append("{}")
+            self.record_args_fragment(self._current_tool_idx, "{}")
+        self.record_args_final(self._current_tool_idx, dict(self._current_args))
 
     def _step_value(self, tool_event, request) -> str:
         idx = self._buffer.find(self._ARG_VALUE_CLOSE)
@@ -294,12 +322,7 @@ class GLMToolCallStreamer(BaseToolCallStreamer):
             self._state = self._KEY
             self._key_buffer = ""
         else:
-            if not tool_event["present"]:
-                tool_event["present"] = True
-                tool_event["index"] = self._current_tool_idx
-            tool_event["args_parts"].append("}")
-            self.record_args_fragment(self._current_tool_idx, "}")
-            self.record_args_final(self._current_tool_idx, dict(self._current_args))
+            self._emit_tool_close(tool_event)
             self._state = self._OUTSIDE
         return "progress"
 

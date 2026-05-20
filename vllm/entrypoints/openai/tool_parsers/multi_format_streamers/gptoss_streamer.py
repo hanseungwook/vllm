@@ -153,9 +153,13 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
                     )
                 )
                 self.record_args_fragment(self._tool_index, new_to_emit)
-            self.record_args_final(
-                self._tool_index, json.loads(args_portion) if args_portion else {}
-            )
+            try:
+                parsed_args = json.loads(args_portion) if args_portion else {}
+            except json.JSONDecodeError:
+                # Match the non-streaming behavior: malformed JSON args
+                # degrade to an empty dict rather than killing the stream.
+                parsed_args = {}
+            self.record_args_final(self._tool_index, parsed_args)
             self._buffer = self._buffer[close_idx + len(_TOOL_CALL_CLOSE) :]
             self._state = _STATE_OUTSIDE
             self._args_emitted_len = 0
