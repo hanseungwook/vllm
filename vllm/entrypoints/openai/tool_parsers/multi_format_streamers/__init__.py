@@ -32,24 +32,21 @@ def build_streamer(
     no streamer is registered for that format (caller should fall back
     to the no-stream behavior).
     """
-    if tool_format in ("xml", "xml_typed"):
-        from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.ifm_xml_streamer import (  # noqa: E501
-            IFMXMLToolCallStreamer,
+    if tool_format in ("xml", "xml_typed", "glm"):
+        # Single unified streamer ported from upstream Glm4MoeModelToolParser
+        # (khluu/glm5 branch). The constructor selects markers + feature
+        # flags (outer wrapper, <ifm|arg_type>) based on tool_format.
+        from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.glm_style_streamer import (  # noqa: E501
+            GLMStyleToolCallStreamer,
         )
 
-        return IFMXMLToolCallStreamer(tool_format, parser_cls)
+        return GLMStyleToolCallStreamer(tool_format, parser_cls)
     if tool_format == "json":
         from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.ifm_json_streamer import (  # noqa: E501
             IFMJSONToolCallStreamer,
         )
 
         return IFMJSONToolCallStreamer(tool_format, parser_cls)
-    if tool_format == "glm":
-        from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.glm_streamer import (  # noqa: E501
-            GLMToolCallStreamer,
-        )
-
-        return GLMToolCallStreamer(tool_format, parser_cls)
     if tool_format in ("minimax", "dsv32"):
         from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.minimax_streamer import (  # noqa: E501
             MinimaxToolCallStreamer,
