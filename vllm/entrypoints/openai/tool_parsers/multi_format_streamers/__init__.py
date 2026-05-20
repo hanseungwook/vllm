@@ -26,18 +26,24 @@ __all__ = ["BaseToolCallStreamer", "build_streamer"]
 
 def build_streamer(
     tool_format: str,
-    parser_cls: "type[MultiFormatToolParser]",
+    parser_cls: type[MultiFormatToolParser],
 ) -> BaseToolCallStreamer | None:
     """Return a streamer instance for ``tool_format``, or ``None`` if
     no streamer is registered for that format (caller should fall back
     to the no-stream behavior).
     """
-    if tool_format in ("xml", "xml_typed", "json"):
-        from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.ifm_streamer import (  # noqa: E501
-            IFMToolCallStreamer,
+    if tool_format in ("xml", "xml_typed"):
+        from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.ifm_xml_streamer import (  # noqa: E501
+            IFMXMLToolCallStreamer,
         )
 
-        return IFMToolCallStreamer(tool_format, parser_cls)
+        return IFMXMLToolCallStreamer(tool_format, parser_cls)
+    if tool_format == "json":
+        from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.ifm_json_streamer import (  # noqa: E501
+            IFMJSONToolCallStreamer,
+        )
+
+        return IFMJSONToolCallStreamer(tool_format, parser_cls)
     if tool_format == "glm":
         from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.glm_streamer import (  # noqa: E501
             GLMToolCallStreamer,

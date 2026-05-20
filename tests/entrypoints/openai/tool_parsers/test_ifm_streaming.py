@@ -442,6 +442,33 @@ def test_request_state_resets_between_streams():
     assert second.tool_calls[0].function.name == "get_weather"
 
 
+def test_xml_eos_mid_call_records_partial_state_for_flush():
+    """Model stops mid-call (EOS without ``</ifm|tool_call>``) — ``serving_chat``
+    must still see ``finish_reason="tool_calls"`` and flush the missing ``}``.
+    """
+    parser = make_parser("xml")
+    request = make_request()
+    # No `</ifm|tool_call>`: the stream ends mid-call.
+    model_output = (
+        "<ifm|tool_call>get_weather"
+        "<ifm|arg_key>city</ifm|arg_key>"
+        "<ifm|arg_value>SF</ifm|arg_value>"
+    )
+    run_tool_extraction_streaming(parser, model_output, request=request)
+    streamer = parser._streamer
+    assert streamer is not None
+    mirror = streamer.prev_tool_call_arr
+    assert len(mirror) == 1, (
+        f"expected one in-progress tool call recorded, got {mirror!r}"
+    )
+    assert mirror[0]["name"] == "get_weather"
+    assert mirror[0]["arguments"] == {"city": "SF"}
+    streamed = streamer.streamed_args_for_tool[0]
+    # No closing `}` — ``serving_chat``'s flush logic emits the diff:
+    #   ``json.dumps({"city": "SF"}).replace(streamed, "", 1) == "}"``.
+    assert streamed == '{"city": "SF"'
+
+
 def test_streaming_mirror_records_tools_for_end_of_stream_flush():
     """``serving_chat.py`` reads ``prev_tool_call_arr`` /
     ``streamed_args_for_tool`` from the parser at end-of-stream. The
