@@ -25,6 +25,18 @@ state. Because each call's full coerced JSON is emitted atomically, the
 flush is always a no-op once the call closes; if EOS hits while the body
 is still buffering we can't recover a partial JSON object, so nothing is
 recorded for that aborted call.
+
+Known limitation: when a single ``<ifm|tool_call>[...]</ifm|tool_call>``
+list-body produces N>1 calls AND the closing marker arrives in the same
+output chunk as ``finish_reason``, ``serving_chat.py``'s flush logic
+indexes ``delta_message.tool_calls[0]`` against ``prev_tool_call_arr[-1]``
+(the last call) and can mis-compute the remaining-args diff. In
+practice this is rare because real tokenizers separate ``</ifm|tool_call>``
+from ``<EOS>`` into distinct tokens (and therefore distinct ``feed()``
+calls), so the final chunk for ``feed()`` sees only EOS and emits no
+tool_calls. Multi-chunk streaming is unaffected. A complete fix
+requires ``serving_chat`` to handle multi-tool-call deltas; tracked as
+a follow-up.
 """
 
 from __future__ import annotations
