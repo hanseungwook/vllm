@@ -2,47 +2,41 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Streaming tool-call parser for the IFM (LLM360) ``json`` format.
 
-Grammar::
+Grammar (matches the non-streaming ``_extract_ifm_json_tool_calls``)::
 
-    <ifm|tool_call>{"name": "...", "arguments": {...}}</ifm|tool_call>
+    <ifm|tool_call>{"name": "X", "arguments": {...}}</ifm|tool_call>
+    <ifm|tool_call>[{"name": "fa", ...}, {"name": "fb", ...}]</ifm|tool_call>
+    <ifm|tool_call>{"function": {"name": "X", "arguments": {...}}}</ifm|tool_call>
 
-or a list of calls inside one block::
+The body is JSON. ``partial_json_parser`` decodes whatever portion has
+arrived so far, so the function name is emitted as soon as it's complete
+and ``arguments`` stream as a series of diffs (Hermes/Llama3 pattern).
+The concatenation of streamed argument fragments always equals the
+canonical coerced JSON the non-streaming parser would have produced.
 
-    <ifm|tool_call>[{"name": "fa", "arguments": {...}},
-                    {"name": "fb", "arguments": {...}}]</ifm|tool_call>
+Invariant after every emit::
 
-The body is JSON and cannot be parsed incrementally, so this streamer
-buffers everything between ``<ifm|tool_call>`` and ``</ifm|tool_call>``,
-parses atomically once the close marker arrives, and emits one complete
-``DeltaToolCall`` per call. See
-``MultiFormatToolParser._extract_ifm_json_tool_calls`` for the
-non-streaming reference behavior.
+    json.dumps(prev_tool_call_arr[i]['arguments'], ensure_ascii=False)
+        .startswith(streamed_args_for_tool[i])
 
-``prev_tool_call_arr`` and ``streamed_args_for_tool`` are inherited from
-``BaseToolCallStreamer`` and aliased to the owning parser instance, so
-``serving_chat.py``'s end-of-stream flush logic sees the live streaming
-state. Because each call's full coerced JSON is emitted atomically, the
-flush is always a no-op once the call closes; if EOS hits while the body
-is still buffering we can't recover a partial JSON object, so nothing is
-recorded for that aborted call.
-
-Known limitation: when a single ``<ifm|tool_call>[...]</ifm|tool_call>``
-list-body produces N>1 calls AND the closing marker arrives in the same
-output chunk as ``finish_reason``, ``serving_chat.py``'s flush logic
-indexes ``delta_message.tool_calls[0]`` against ``prev_tool_call_arr[-1]``
-(the last call) and can mis-compute the remaining-args diff. In
-practice this is rare because real tokenizers separate ``</ifm|tool_call>``
-from ``<EOS>`` into distinct tokens (and therefore distinct ``feed()``
-calls), so the final chunk for ``feed()`` sees only EOS and emits no
-tool_calls. Multi-chunk streaming is unaffected. A complete fix
-requires ``serving_chat`` to handle multi-tool-call deltas; tracked as
-a follow-up.
+That is what makes ``serving_chat.py``'s end-of-stream flush a no-op
+(or a small tail diff) rather than a duplication: ``serving_chat``
+indexes by ``len(prev_tool_call_arr) - 1`` and computes the tail by
+length-stripping ``streamed_args_for_tool[i]`` from the canonical args
+JSON. Because we record per-index state and stream in canonical order,
+the list-body case (``[{...},{...}]`` in a single block) no longer
+emits multiple ``tool_calls`` in one ``DeltaMessage`` — each list
+element becomes its own sequence of deltas with a distinct ``index``.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
+
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.protocol import (
@@ -54,10 +48,29 @@ from vllm.entrypoints.openai.protocol import (
 from vllm.entrypoints.openai.tool_parsers.multi_format_streamers.base import (
     BaseToolCallStreamer,
 )
+from vllm.entrypoints.openai.tool_parsers.utils import find_common_prefix
+
+
+@dataclass
+class _ContentEmission:
+    text: str
+
+
+@dataclass
+class _ToolNameEmission:
+    index: int
+    id: str
+    name: str
+
+
+@dataclass
+class _ToolArgsEmission:
+    index: int
+    args: str
 
 
 class IFMJSONToolCallStreamer(BaseToolCallStreamer):
-    """Streamer for IFM ``json`` format."""
+    """Incremental streamer for IFM ``json`` format."""
 
     _OUTER_OPEN = "<ifm|tool_calls>"
     _OUTER_CLOSE = "</ifm|tool_calls>"
@@ -65,16 +78,31 @@ class IFMJSONToolCallStreamer(BaseToolCallStreamer):
     _CALL_CLOSE = "</ifm|tool_call>"
     _ALL_MARKERS = (_OUTER_OPEN, _OUTER_CLOSE, _CALL_OPEN, _CALL_CLOSE)
 
+    _BEFORE = "before"
+    _BETWEEN = "between"
+    _IN_BLOCK = "in_block"
+    _AFTER_WRAPPER = "after_wrapper"
+
+    _MAX_BUFFER_BYTES = 1 << 20
+
     def __init__(self, tool_format: str, parser_cls) -> None:
         super().__init__(tool_format, parser_cls)
         self._reset_state()
 
     def _reset_state(self) -> None:
         self._buffer: str = ""
-        self._in_block: bool = False
+        self._phase: str = self._BEFORE
+        self._has_outer_wrapper: bool = False
         self._saw_first_call: bool = False
-        self._exhausted: bool = False
-        self._next_index: int = 0
+        # Per-block partial-parse state.
+        self._block_buffer: str = ""
+        # First tool index for the current ``<ifm|tool_call>`` block. Set
+        # when the block opens and frozen for the lifetime of that block
+        # so list-body indices stay consistent across feeds.
+        self._block_start_id: int = 0
+        # Per-tool incremental-stream state.
+        self._current_tool_id: int = -1
+        self._current_tool_name_sent: bool = False
         # Clear (not reassign) so the alias set in
         # MultiFormatToolParser.__init__ stays valid across resets.
         self.prev_tool_call_arr.clear()
@@ -82,8 +110,8 @@ class IFMJSONToolCallStreamer(BaseToolCallStreamer):
 
     @staticmethod
     def _partial_marker_suffix_len(buffer: str, markers: Sequence[str]) -> int:
-        """Longest non-empty suffix of ``buffer`` that is a prefix of any
-        marker. Used to hold back potentially-partial markers."""
+        """Longest non-empty suffix of ``buffer`` that is a strict prefix of
+        any marker. Used to hold back potentially-partial markers."""
         n = len(buffer)
         if n == 0:
             return 0
@@ -108,125 +136,360 @@ class IFMJSONToolCallStreamer(BaseToolCallStreamer):
         if previous_text == "":
             self._reset_state()
         self._buffer += delta_text
+        if len(self._buffer) > self._MAX_BUFFER_BYTES:
+            self._buffer = self._buffer[-(self._MAX_BUFFER_BYTES // 2) :]
 
-        content_parts: list[str] = []
-        tool_deltas: list[DeltaToolCall] = []
-
+        emissions: list = []
         while True:
-            if self._exhausted:
-                self._buffer = ""
+            if not self._step(emissions, request):
                 break
+        return self._build_delta(emissions)
 
-            if not self._in_block:
-                if not self._step_outside(content_parts):
-                    break
-                continue
+    def _step(self, emissions: list, request: ChatCompletionRequest) -> bool:
+        phase = self._phase
+        if phase == self._BEFORE:
+            return self._step_before(emissions)
+        if phase == self._BETWEEN:
+            return self._step_between()
+        if phase == self._IN_BLOCK:
+            return self._step_in_block(emissions, request)
+        # _AFTER_WRAPPER: outer </ifm|tool_calls> seen. ``finditer`` in the
+        # non-streaming parser still picks up later <ifm|tool_call> blocks,
+        # so we keep scanning but drop intervening content.
+        return self._step_after_wrapper()
 
-            end_idx = self._buffer.find(self._CALL_CLOSE)
-            if end_idx == -1:
-                break
-            body = self._buffer[:end_idx].strip()
-            self._buffer = self._buffer[end_idx + len(self._CALL_CLOSE) :]
-            self._in_block = False
-            self._saw_first_call = True
-            self._parse_block_body(body, request, tool_deltas)
-
-        return self._build_delta(content_parts, tool_deltas)
-
-    def _step_outside(self, content_parts: list[str]) -> bool:
-        """Consume the buffer up to the next marker. Returns ``True`` if
-        progress was made (caller should loop), ``False`` to break out."""
-        idx_outer_open = self._buffer.find(self._OUTER_OPEN)
-        idx_outer_close = self._buffer.find(self._OUTER_CLOSE)
-        idx_call_open = self._buffer.find(self._CALL_OPEN)
-
-        best = -1
-        marker = ""
-        kind = ""
-        for i, m, k in (
-            (idx_outer_open, self._OUTER_OPEN, "outer_open"),
-            (idx_outer_close, self._OUTER_CLOSE, "outer_close"),
-            (idx_call_open, self._CALL_OPEN, "call_open"),
-        ):
-            if i != -1 and (best == -1 or i < best):
-                best, marker, kind = i, m, k
-
-        if best == -1:
-            hold = self._partial_marker_suffix_len(self._buffer, self._ALL_MARKERS)
+    def _step_before(self, emissions: list) -> bool:
+        markers = (self._OUTER_OPEN, self._CALL_OPEN)
+        pos = self._first_marker(markers)
+        if pos is None:
+            hold = self._partial_marker_suffix_len(self._buffer, markers)
             safe_end = len(self._buffer) - hold
             if safe_end > 0:
                 emit = self._buffer[:safe_end]
-                if emit and not self._saw_first_call:
-                    content_parts.append(emit)
                 self._buffer = self._buffer[safe_end:]
+                if emit and not self._saw_first_call:
+                    emissions.append(_ContentEmission(emit))
             return False
 
-        prefix = self._buffer[:best]
+        idx, marker = pos
+        prefix = self._buffer[:idx]
         if prefix and not self._saw_first_call:
-            content_parts.append(prefix)
-        self._buffer = self._buffer[best + len(marker) :]
-        if kind == "outer_close":
-            self._exhausted = True
-        elif kind == "call_open":
-            self._in_block = True
+            emissions.append(_ContentEmission(prefix))
+        self._buffer = self._buffer[idx + len(marker) :]
+
+        if marker == self._OUTER_OPEN:
+            self._has_outer_wrapper = True
+            self._phase = self._BETWEEN
+        else:
+            self._enter_block()
         return True
 
-    def _parse_block_body(
+    def _step_between(self) -> bool:
+        markers: tuple[str, ...] = (self._CALL_OPEN,)
+        if self._has_outer_wrapper:
+            markers = markers + (self._OUTER_CLOSE,)
+        pos = self._first_marker(markers)
+        if pos is None:
+            hold = self._partial_marker_suffix_len(self._buffer, markers)
+            safe_end = len(self._buffer) - hold
+            if safe_end > 0:
+                # Discard intervening content (non-streaming reference only
+                # treats the pre-first-tool prefix as content).
+                self._buffer = self._buffer[safe_end:]
+            return False
+        idx, marker = pos
+        self._buffer = self._buffer[idx + len(marker) :]
+        if marker == self._CALL_OPEN:
+            self._enter_block()
+        else:
+            self._phase = self._AFTER_WRAPPER
+        return True
+
+    def _step_after_wrapper(self) -> bool:
+        # finditer matches every <ifm|tool_call> regardless of wrappers, so
+        # keep looking for either a new outer wrapper or a bare block. Drop
+        # any intervening text.
+        markers = (self._OUTER_OPEN, self._CALL_OPEN)
+        pos = self._first_marker(markers)
+        if pos is None:
+            hold = self._partial_marker_suffix_len(self._buffer, markers)
+            safe_end = len(self._buffer) - hold
+            if safe_end > 0:
+                self._buffer = self._buffer[safe_end:]
+            return False
+        idx, marker = pos
+        self._buffer = self._buffer[idx + len(marker) :]
+        if marker == self._OUTER_OPEN:
+            self._has_outer_wrapper = True
+            self._phase = self._BETWEEN
+        else:
+            self._enter_block()
+        return True
+
+    def _enter_block(self) -> None:
+        self._phase = self._IN_BLOCK
+        self._block_buffer = ""
+        self._saw_first_call = True
+        self._block_start_id = (
+            self._current_tool_id + 1 if self._current_tool_id >= 0 else 0
+        )
+
+    def _step_in_block(
         self,
-        body: str,
+        emissions: list,
         request: ChatCompletionRequest,
-        tool_deltas: list[DeltaToolCall],
+    ) -> bool:
+        close_idx = self._buffer.find(self._CALL_CLOSE)
+        if close_idx != -1:
+            self._block_buffer += self._buffer[:close_idx]
+            self._buffer = self._buffer[close_idx + len(self._CALL_CLOSE) :]
+            self._finalize_block(emissions, request)
+            self._phase = self._BETWEEN
+            return True
+
+        # No close yet — feed as much as is safely past any partial close
+        # marker into the block buffer and re-run partial parsing.
+        hold = self._partial_marker_suffix_len(self._buffer, (self._CALL_CLOSE,))
+        safe_end = len(self._buffer) - hold
+        if safe_end > 0:
+            self._block_buffer += self._buffer[:safe_end]
+            self._buffer = self._buffer[safe_end:]
+            self._update_partial(emissions, request)
+        return False
+
+    def _finalize_block(
+        self,
+        emissions: list,
+        request: ChatCompletionRequest,
     ) -> None:
+        body = self._block_buffer.strip()
+        self._block_buffer = ""
+        if not body:
+            return
         try:
             parsed = json.loads(body)
         except json.JSONDecodeError:
             # Match non-streaming behavior: silently skip malformed JSON.
             return
-        raw_calls = parsed if isinstance(parsed, list) else [parsed]
-        for raw_call in raw_calls:
-            if not isinstance(raw_call, dict):
-                continue
-            function = raw_call.get("function", raw_call)
-            if not isinstance(function, dict):
-                continue
-            name = function.get("name")
-            if not name or not isinstance(name, str):
-                continue
-            try:
-                arguments = self._parser._json_arguments_to_dict(
-                    function.get("arguments", {})
-                )
-            except Exception:
-                continue
-            try:
-                coerced = self._parser._coerce_arguments(name, arguments, request.tools)
-            except Exception:
-                coerced = arguments
-
-            args_json = json.dumps(coerced, ensure_ascii=False)
-            index = self._next_index
-            self._next_index += 1
-            tool_id = make_tool_call_id()
-            self.record_tool_call_start(index, name)
-            self.record_args_fragment(index, args_json)
-            self.record_args_final(index, dict(coerced))
-            tool_deltas.append(
-                DeltaToolCall(
-                    index=index,
-                    id=tool_id,
-                    type="function",
-                    function=DeltaFunctionCall(name=name, arguments=args_json),
-                )
+        items = parsed if isinstance(parsed, list) else [parsed]
+        for i, raw_call in enumerate(items):
+            target_id = self._block_start_id + i
+            self._process_item(
+                emissions, raw_call, target_id, is_complete=True, request=request
             )
 
-    def _build_delta(
+    def _update_partial(
         self,
-        content_parts: list[str],
-        tool_deltas: list[DeltaToolCall],
-    ) -> DeltaMessage | None:
-        if tool_deltas:
-            content = "".join(content_parts) if content_parts else None
-            return DeltaMessage(content=content, tool_calls=tool_deltas)
-        if content_parts:
-            return DeltaMessage(content="".join(content_parts))
+        emissions: list,
+        request: ChatCompletionRequest,
+    ) -> None:
+        body = self._block_buffer.lstrip()
+        if not body:
+            return
+        # Always exclude partial strings: with ``Allow.ALL`` a list body like
+        # ``[{...}, {"name":"ba`` parses to two items where the second has a
+        # truncated name ("ba"), which would let us advance to a new tool
+        # with the wrong name. Excluding partial strings drops the in-flight
+        # element entirely until its name closes, so the advance is safe.
+        # Hermes can use the looser flag because each call lives inside its
+        # own ``<tool_call>...</tool_call>`` markers — IFM JSON packs
+        # multiple calls into one block, so we need the stricter rule.
+        flags = Allow.ALL & ~Allow.STR
+        try:
+            parsed = partial_json_parser.loads(body, flags)
+        except (
+            partial_json_parser.core.exceptions.MalformedJSON,
+            json.JSONDecodeError,
+        ):
+            return
+        if isinstance(parsed, list):
+            items = parsed
+        elif isinstance(parsed, dict):
+            items = [parsed]
+        else:
+            return
+        if not items:
+            return
+        last_index = len(items) - 1
+        for i, raw_call in enumerate(items):
+            target_id = self._block_start_id + i
+            # Items before the partial tail are JSON-complete because they
+            # were followed by a comma; the last item is treated as partial.
+            item_complete = i < last_index
+            self._process_item(
+                emissions,
+                raw_call,
+                target_id,
+                is_complete=item_complete,
+                request=request,
+            )
+
+    def _process_item(
+        self,
+        emissions: list,
+        raw_call,
+        target_id: int,
+        is_complete: bool,
+        request: ChatCompletionRequest,
+    ) -> None:
+        if not isinstance(raw_call, dict):
+            return
+        function = raw_call.get("function", raw_call)
+        if not isinstance(function, dict):
+            return
+        name = function.get("name")
+        cur_arguments = function.get("arguments")
+        if isinstance(cur_arguments, str):
+            try:
+                cur_arguments = (
+                    json.loads(cur_arguments) if cur_arguments.strip() else {}
+                )
+            except json.JSONDecodeError:
+                cur_arguments = None
+        if not isinstance(cur_arguments, dict):
+            cur_arguments = {}
+
+        if target_id < self._current_tool_id:
+            # Already moved past this tool — its args were flushed when we
+            # advanced past it. Nothing to do.
+            return
+
+        if target_id > self._current_tool_id:
+            if not isinstance(name, str) or not name:
+                # Can't start a tool until its name is fully parsed.
+                return
+            if self._current_tool_id >= 0:
+                self._flush_remaining_args(emissions)
+            self._current_tool_id = target_id
+            self._current_tool_name_sent = False
+            self.record_tool_call_start(target_id, name)
+
+        if not self._current_tool_name_sent:
+            if not isinstance(name, str) or not name:
+                return
+            emissions.append(
+                _ToolNameEmission(
+                    index=self._current_tool_id,
+                    id=make_tool_call_id(),
+                    name=name,
+                )
+            )
+            self._current_tool_name_sent = True
+
+        self._emit_args(emissions, name, cur_arguments, request, is_complete)
+
+    def _emit_args(
+        self,
+        emissions: list,
+        name: str | None,
+        cur_arguments: dict,
+        request: ChatCompletionRequest,
+        is_complete: bool,
+    ) -> None:
+        # ``name`` is guaranteed to be a non-empty string in the streaming
+        # path that reaches here, but ``_coerce_arguments`` accepts any
+        # ``tool_name`` (it just won't find a schema for a non-string), so
+        # we keep the looser type instead of inserting an ``assert``.
+        try:
+            coerced = self._parser._coerce_arguments(name, cur_arguments, request.tools)
+        except Exception:
+            coerced = cur_arguments
+
+        cur_args_json = json.dumps(coerced, ensure_ascii=False)
+        idx = self._current_tool_id
+        sent = len(self.streamed_args_for_tool[idx])
+        prev_arguments = self.prev_tool_call_arr[idx].get("arguments")
+
+        if is_complete:
+            argument_diff = cur_args_json[sent:]
+        elif prev_arguments is not None:
+            prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+            if cur_args_json == prev_args_json:
+                argument_diff = ""
+            else:
+                prefix = find_common_prefix(prev_args_json, cur_args_json)
+                argument_diff = prefix[sent:] if len(prefix) > sent else ""
+        else:
+            argument_diff = ""
+
+        # Always update the recorded coerced dict so EOS sees the latest
+        # best-effort args even before any diff has been emitted.
+        self.record_args_final(idx, dict(coerced))
+        if argument_diff:
+            self.record_args_fragment(idx, argument_diff)
+            emissions.append(_ToolArgsEmission(idx, argument_diff))
+
+    def _flush_remaining_args(self, emissions: list) -> None:
+        """When advancing past the current tool to a new one, emit any
+        diff between what's been streamed and the recorded coerced JSON.
+        Past tools have been forced complete by the comma separating them
+        from the next list element, so it's safe to commit the tail now.
+        """
+        idx = self._current_tool_id
+        if idx < 0:
+            return
+        arguments = self.prev_tool_call_arr[idx].get("arguments")
+        if arguments is None:
+            return
+        args_json = json.dumps(arguments, ensure_ascii=False)
+        sent = len(self.streamed_args_for_tool[idx])
+        diff = args_json[sent:]
+        if diff:
+            self.record_args_fragment(idx, diff)
+            emissions.append(_ToolArgsEmission(idx, diff))
+
+    def _first_marker(self, markers: Sequence[str]) -> tuple[int, str] | None:
+        best_idx = -1
+        best_marker: str | None = None
+        for marker in markers:
+            idx = self._buffer.find(marker)
+            if idx == -1:
+                continue
+            if best_idx == -1 or idx < best_idx:
+                best_idx, best_marker = idx, marker
+        if best_marker is None:
+            return None
+        return best_idx, best_marker
+
+    def _build_delta(self, emissions: list) -> DeltaMessage | None:
+        content_parts: list[str] = []
+        tool_calls: dict[int, DeltaToolCall] = {}
+        for em in emissions:
+            if isinstance(em, _ContentEmission):
+                content_parts.append(em.text)
+            elif isinstance(em, _ToolNameEmission):
+                existing = tool_calls.get(em.index)
+                if existing is None:
+                    tool_calls[em.index] = DeltaToolCall(
+                        index=em.index,
+                        id=em.id,
+                        type="function",
+                        function=DeltaFunctionCall(name=em.name),
+                    )
+                else:
+                    # Name emission for an already-touched tool index would
+                    # break the OpenAI streaming contract (name must appear
+                    # exactly once). This shouldn't happen but guard anyway.
+                    existing.id = em.id
+                    if existing.function is not None:
+                        existing.function.name = em.name
+            else:  # _ToolArgsEmission
+                existing = tool_calls.get(em.index)
+                if existing is None:
+                    tool_calls[em.index] = DeltaToolCall(
+                        index=em.index,
+                        function=DeltaFunctionCall(arguments=em.args),
+                    )
+                else:
+                    assert existing.function is not None
+                    existing.function.arguments = (
+                        existing.function.arguments or ""
+                    ) + em.args
+
+        content = "".join(content_parts) if content_parts else None
+        tools_list = [tool_calls[k] for k in sorted(tool_calls)] if tool_calls else None
+        if tools_list:
+            return DeltaMessage(content=content, tool_calls=tools_list)
+        if content is not None:
+            return DeltaMessage(content=content)
         return None
