@@ -51,7 +51,6 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
         self._buffer: str = ""
         self._state: str = _STATE_OUTSIDE
         self._tool_index: int = -1
-        self._args_emitted_len: int = 0
         self._first_tool_seen: bool = False
         # Clear (not reassign) so the alias set in
         # MultiFormatToolParser.__init__ stays valid across resets.
@@ -126,7 +125,6 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
             return True
         function_name = match.group(1)
         self._tool_index += 1
-        self._args_emitted_len = 0
         tool_call_deltas.append(
             DeltaToolCall(
                 index=self._tool_index,
@@ -141,55 +139,43 @@ class GPTOSSToolCallStreamer(BaseToolCallStreamer):
         return True
 
     def _step_args(self, tool_call_deltas: list[DeltaToolCall]) -> bool:
+        # Atomic-per-block emit: buffer the entire args body, parse it once
+        # ``</tool_call>`` arrives, then emit canonical ``json.dumps(parsed)``.
+        # Two correctness wins over per-fragment streaming:
+        #   1. EOS arriving mid-args silently drops the args (with the tool's
+        #      name already on the wire from ``_step_header``); ``serving_chat``'s
+        #      flush stays a no-op instead of emitting ``"{}"`` glued onto a
+        #      partial JSON.
+        #   2. Model output with non-canonical whitespace (e.g. ``{"a":1}``)
+        #      is normalized to ``json.dumps`` form, so ``streamed_args_for_tool``
+        #      stays byte-equal to ``json.dumps(prev_tool_call_arr[i]['arguments'])``
+        #      and the flush never duplicates args at end-of-stream.
         close_idx = self._buffer.find(_TOOL_CALL_CLOSE)
-        if close_idx >= 0:
-            args_portion = self._buffer[:close_idx].rstrip()
-            new_to_emit = args_portion[self._args_emitted_len :]
-            if new_to_emit:
-                tool_call_deltas.append(
-                    DeltaToolCall(
-                        index=self._tool_index,
-                        function=DeltaFunctionCall(arguments=new_to_emit),
-                    )
-                )
-                self.record_args_fragment(self._tool_index, new_to_emit)
-            try:
-                parsed_args = json.loads(args_portion) if args_portion else {}
-            except json.JSONDecodeError:
-                # Match the non-streaming behavior: malformed JSON args
-                # degrade to an empty dict rather than killing the stream.
-                parsed_args = {}
-            self.record_args_final(self._tool_index, parsed_args)
-            self._buffer = self._buffer[close_idx + len(_TOOL_CALL_CLOSE) :]
-            self._state = _STATE_OUTSIDE
-            self._args_emitted_len = 0
-            return True
-        safe_end = self._safe_args_end()
-        if safe_end > self._args_emitted_len:
-            new_to_emit = self._buffer[self._args_emitted_len : safe_end]
-            tool_call_deltas.append(
-                DeltaToolCall(
-                    index=self._tool_index,
-                    function=DeltaFunctionCall(arguments=new_to_emit),
-                )
-            )
-            self.record_args_fragment(self._tool_index, new_to_emit)
-            self._args_emitted_len = safe_end
-        return False
+        if close_idx < 0:
+            return False
 
-    def _safe_args_end(self) -> int:
-        # Returns the index up to which the args buffer is safe to emit.
-        # Holds back: any suffix that could be a prefix of ``</tool_call>``,
-        # plus any trailing whitespace (which the non-streaming path strips
-        # via ``.strip()`` before the close tag).
-        n = len(self._buffer)
-        if n == 0:
-            return 0
-        holdback = self._suffix_prefix_length(self._buffer, _TOOL_CALL_CLOSE)
-        end = n - holdback
-        while end > 0 and self._buffer[end - 1].isspace():
-            end -= 1
-        return end
+        args_portion = self._buffer[:close_idx].rstrip()
+        try:
+            parsed_args = json.loads(args_portion) if args_portion else {}
+        except json.JSONDecodeError:
+            # Match the non-streaming behavior: malformed JSON args degrade
+            # to an empty dict rather than killing the stream.
+            parsed_args = {}
+        if not isinstance(parsed_args, dict):
+            parsed_args = {}
+
+        args_json = json.dumps(parsed_args, ensure_ascii=False)
+        tool_call_deltas.append(
+            DeltaToolCall(
+                index=self._tool_index,
+                function=DeltaFunctionCall(arguments=args_json),
+            )
+        )
+        self.record_args_fragment(self._tool_index, args_json)
+        self.record_args_final(self._tool_index, parsed_args)
+        self._buffer = self._buffer[close_idx + len(_TOOL_CALL_CLOSE) :]
+        self._state = _STATE_OUTSIDE
+        return True
 
     @staticmethod
     def _suffix_prefix_length(buffer: str, tag: str) -> int:
